@@ -74,6 +74,20 @@ class AOKVQADataset(Dataset):
             'question_id': item['question_id']
         }
 
+def collate_aokvqa(batch):
+    # images → tensor stack
+    images = torch.stack([b['image'] for b in batch], dim=0)
+    # questions → list[str]
+    questions = [b['question'] for b in batch]
+    # options → list[list[str]] (pad to max_M with '' keep same length)
+    max_M = max(len(b['choices']) for b in batch)
+    pad = lambda lst: lst + ['']*(max_M-len(lst))
+    options = [pad(b['choices']) for b in batch]
+    # labels
+    labels = torch.tensor([b['correct_choice_idx'] for b in batch])
+    return images, questions, options, labels
+
+
 
 # Example usage
 if __name__ == "__main__":

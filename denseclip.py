@@ -1,18 +1,3 @@
-"""
-Minimal DenseCLIP heatmap inference (no mmcv/mmseg/mmdet).
-- Supports RN50/RN101 (CLIPResNetWithAttention) and ViT-B/16 (CLIPVisionTransformer with get_embeddings=True)
-- Loads: backbone, text_encoder, context_decoder, contexts, gamma from a DenseCLIP *.pth checkpoint
-- Computes: similarity heatmap between pooled text embedding (context-conditioned) and per-patch visual embeddings
-
-Usage:
-python denseclip_heatmap.py \
-  --ckpt /path/to/denseclip_checkpoint.pth \
-  --arch rn50 \        # rn50 | rn101 | vit-b-16
-  --image /path/to/image.jpg \
-  --text "a photo of a dog on the grass" \
-  --out heatmap.png
-"""
-
 import math
 import os
 import argparse
@@ -23,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch.nn import MultiheadAttention
 
 # ----------------------------
 # Utilities / tokenizer
@@ -134,13 +119,12 @@ class SimpleTokenizer(object):
 
 _tokenizer = SimpleTokenizer()
 
-def tokenize_texts(texts: Union[str, List[str]], context_length: int = 7, truncate: bool = True) -> torch.LongTensor:
+def tokenize_texts(texts: Union[str, List[str]], context_length: int = 5, truncate: bool = True) -> torch.LongTensor:
     if isinstance(texts, str):
         texts = [texts]
     sot = _tokenizer.encoder["<|startoftext|>"]
     eot = _tokenizer.encoder["<|endoftext|>"]
-    #all_tokens = [[sot] + _tokenizer.encode(t) + [eot] for t in texts]
-    all_tokens = [_tokenizer.encode(t) for t in texts]
+    all_tokens = [[sot] + _tokenizer.encode(t) + [eot] for t in texts]
     result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
     for i, tokens in enumerate(all_tokens):
         if len(tokens) > context_length:
@@ -554,6 +538,7 @@ class DenseCLIP(nn.Module):
         # We pick that from (self.text_encoder.context_length - self.contexts.shape[1])
         n_text = self.text_encoder.context_length - self.contexts.shape[1]
         tok = tokenize_texts(texts, context_length=n_text).to(device)
+        '''
         for i, text in enumerate(texts):
             tokens = tok[i].cpu().numpy()
             # Remove padding (zeros)
@@ -570,6 +555,7 @@ class DenseCLIP(nn.Module):
             print(f"Decoded: {decoded_tokens}")
             print(f"Context length limit: {n_text}")
             print("---")
+        '''
         B = 1  # we use single-image flow; text encoder expands later
         # Expand learned contexts to batch
         ctx = self.contexts.to(device).expand(B, -1, -1)  # [B, N2, C_emb]
@@ -578,163 +564,3 @@ class DenseCLIP(nn.Module):
         # adapt text using visual context per image later (call-conditioned)
         return t  # not adapted yet
 
-    @torch.no_grad()
-    def similarity_heatmap(self, image: torch.Tensor, texts: List[str], original_size=None):
-        """
-        image: [1,3,H,W] (CLIP-normalized, typically 256x256 for processing)
-        texts: list with one string (or more; we use the first)
-        original_size: (width, height) tuple for scaling heatmap back to original dimensions
-        Returns: heatmap [H,W] in [0,1] scaled to original_size if provided
-        """
-        device = image.device
-        image = image.to(device=device, dtype=torch.float32)
-        g, fmap = self.encode_image_to_embeddings(image)     # g: [1,C], fmap: [1,C,h,w]
-        B,C,h,w = fmap.shape
-        # Build visual context sequence: [B, N=1+hw, C]
-        visual_context = torch.cat([g.reshape(B,C,1), fmap.reshape(B,C,h*w)], dim=2).permute(0,2,1)
-        # Base text features (B,K,C); adapt via context decoder
-        t0 = self.encode_text(texts, device=device)          # B,K,C
-        t_diff = self.context_decoder(t0, visual_context)    # B,K,C
-        t = t0 + self.gamma.to(device) * t_diff              # B,K,C
-        # normalize and compute similarity
-        t = F.normalize(t, dim=-1)                           # B,K,C
-        v = F.normalize(fmap, dim=1)                         # B,C,h,w
-        # If multiple texts, use the first (K=1 typical here)
-        heat = torch.einsum('bchw,bkc->bkhw', v, t)# / self.tau   # B,K,h,w
-        heat = heat[:,0]  # B,h,w
-        
-        # upsample to original image size if provided, otherwise to processed image size
-        if original_size is not None:
-            H, W = original_size[1], original_size[0]  # original_size is (width, height)
-        else:
-            H, W = image.shape[-2:]
-        heat = F.interpolate(heat.unsqueeze(1), size=(H,W), mode='bilinear', align_corners=False).squeeze(1)
-        # normalize to [0,1]
-        #heat = heat + 1
-        #heat = heat - heat.amin(dim=[1,2], keepdim=True)
-        #heat = heat / (heat.amax(dim=[1,2], keepdim=True) + 1e-8)
-        return heat[0].cpu().numpy()  # H,W
-
-
-# ----------------------------
-# Image preprocessing & saving
-# ----------------------------
-CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
-CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
-
-def load_image_clip(path, device='cuda', target_size=256):
-    """
-    Load image, resize to target_size x target_size for processing, 
-    but keep original image for final overlay.
-    Returns: (original_pil, resized_tensor, original_size)
-    """
-    img_original = Image.open(path).convert('RGB')
-    original_size = img_original.size  # (width, height)
-    
-    # Resize for processing
-    img_resized = img_original.resize((target_size, target_size), Image.LANCZOS)
-    
-    # Convert resized image to tensor
-    x = np.array(img_resized).astype(np.float32) / 255.0
-    x = (x - np.array(CLIP_MEAN)) / np.array(CLIP_STD)
-    x = torch.from_numpy(x).permute(2,0,1).unsqueeze(0).to(device)  # [1,3,H,W]
-    return img_original, x, original_size
-
-def save_heatmap_overlay(rgb_pil: Image.Image, heat: np.ndarray, out_path: str, alpha=0.45, grid_size=16):
-    """Saves an overlay of the heatmap on the image and includes numerical scores."""
-    import matplotlib.pyplot as plt
-    import matplotlib.cm as cm
-    
-    # Create the color overlay
-    rgb = np.array(rgb_pil).astype(np.float32)/255.0
-    cmap = cm.get_cmap('jet')
-    color = cmap(heat)[...,:3]  # H,W,3
-    overlay_np = (1-alpha)*rgb + alpha*color
-    overlay_np = (overlay_np*255).clip(0,255).astype(np.uint8)
-    
-    # Convert to PIL Image to draw text on it
-    overlay_img = Image.fromarray(overlay_np)
-    draw = ImageDraw.Draw(overlay_img)
-    
-    # Try to load a font, fall back to a default one
-    try:
-        font = ImageFont.truetype("arial.ttf", 14)
-    except IOError:
-        font = ImageFont.load_default()
-
-    img_w, img_h = overlay_img.size
-    step_x, step_y = img_w // grid_size, img_h // grid_size
-
-    # Iterate over grid cells to draw the max score in each
-    for i in range(grid_size):
-        for j in range(grid_size):
-            x1, y1 = j * step_x, i * step_y
-            x2, y2 = x1 + step_x, y1 + step_y
-            
-            # Get max score in the grid cell
-            patch = heat[y1:y2, x1:x2]
-            if patch.size == 0: continue
-            score = np.max(patch)
-            
-            # Position text in the center of the cell
-            text = f"{score:.2f}"
-            
-            try:
-                # Use textbbox for more accurate centering if available
-                text_bbox = draw.textbbox((0, 0), text, font=font)
-                text_w = text_bbox[2] - text_bbox[0]
-                text_h = text_bbox[3] - text_bbox[1]
-            except AttributeError:
-                # Fallback for older Pillow versions
-                text_w, text_h = draw.textsize(text, font=font)
-
-            text_x = x1 + (step_x - text_w) / 2
-            text_y = y1 + (step_y - text_h) / 2
-            
-            # Draw a black outline for better visibility
-            outline_color = 'black'
-            draw.text((text_x - 1, text_y), text, font=font, fill=outline_color)
-            draw.text((text_x + 1, text_y), text, font=font, fill=outline_color)
-            draw.text((text_x, text_y - 1), text, font=font, fill=outline_color)
-            draw.text((text_x, text_y + 1), text, font=font, fill=outline_color)
-
-            # Draw the main white text
-            draw.text((text_x, text_y), text, font=font, fill='white')
-
-    overlay_img.save(out_path)
-
-
-# ----------------------------
-# CLI
-# ----------------------------
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--ckpt', default="/speedy/DenseInject/weights/denseclip.pth")
-    p.add_argument('--arch', default='vit-b-16', choices=['rn50','rn101','vit-b-16'])
-    p.add_argument('--image', default="/speedy/DenseInject/datasets/coco/test2017/000000000001.jpg")
-    p.add_argument('--text', default="car")
-    p.add_argument('--out', default="heatmap_result_resize.png")
-    p.add_argument('--device', default='cuda')
-    args = p.parse_args()
-
-    device = args.device if torch.cuda.is_available() and args.device.startswith('cuda') else 'cpu'
-    model = DenseCLIP(args.arch, args.ckpt, device=device).eval().float()
-
-    pil, x, original_size = load_image_clip(args.image, device=device)
-    heat = model.similarity_heatmap(x, [args.text], original_size)
-    
-    # --- ADDED: Print heatmap statistics --- 
-    print("-" * 40)
-    print(f"📊 Heatmap statistics for text: '{args.text}'")
-    print(f"  - Highest value: {np.max(heat):.4f}")
-    print(f"  - Lowest value:  {np.min(heat):.4f}")
-    print(f"  - Original image size: {original_size[0]}x{original_size[1]}")
-    print(f"  - Processing size: 256x256")
-    print(f"  - Final heatmap size: {heat.shape[1]}x{heat.shape[0]}")
-    print("-" * 40)
-    
-    save_heatmap_overlay(pil, heat, args.out)
-    print(f"✅ Saved heatmap with score overlay to: {args.out}")
-
-if __name__ == '__main__':
-    main()
