@@ -5,11 +5,29 @@ from model import QCDenseCLIP
 import tqdm
 import os
 import wandb
-wandb.init(project="DenseInject", name="Baseline DenseCLIP")
+import torch, torch.nn.functional as F
+DO_WANDB = False
+if DO_WANDB:
+    wandb.init(project="DenseInject", name="DenseCLIP+NB")
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model  = QCDenseCLIP('/speedy/DenseInject/weights/denseclip.pth', device=device).to(device)
+
+cache_path = "/speedy/DenseInject/denseclipinference/text_embedding_cache.pt"
+blob = torch.load(cache_path, map_location="cpu")
+
+# Pull from cache
+T_cpu   = blob["T_clip"]      # stored as fp16 in your saver
+nb_vecs = blob["nb_vecs"]     # FloatTensor [V, 300] on CPU
+
+# Normalize and move to GPU in bf16
+T_clip = F.normalize(T_cpu.float(), dim=1).to(device, dtype=torch.bfloat16)
+
+# Hand to the model
+model.set_nb_bank(T_clip, nb_vecs)
+
+print(f"Loaded bank: T_clip {T_clip.shape} {T_clip.dtype} on {T_clip.device}; nb_vecs {tuple(nb_vecs.shape)} on CPU")
 
 # Count frozen and trainable parameters
 total_params = sum(p.numel() for p in model.parameters())
@@ -22,10 +40,11 @@ print(f"  Trainable parameters: {trainable_params:,}")
 print(f"  Frozen parameters: {frozen_params:,}")
 print(f"  Trainable ratio: {trainable_params/total_params*100:.1f}%")
 
-wandb.log({"train/total_params": total_params,
-           "train/trainable_params": trainable_params,
-           "train/frozen_params": frozen_params,
-           "train/trainable_ratio": trainable_params/total_params*100})
+if DO_WANDB:
+    wandb.log({"train/total_params": total_params,
+            "train/trainable_params": trainable_params,
+            "train/frozen_params": frozen_params,
+            "train/trainable_ratio": trainable_params/total_params*100})
 
 train_set = AOKVQADataset(split='train')
 val_set   = AOKVQADataset(split='val')
@@ -68,7 +87,8 @@ for epoch in range(10):
         loss.backward()
         opt.step()
 
-        wandb.log({"train/loss": loss.item()})
+        if DO_WANDB:
+            wandb.log({"train/loss": loss.item()})
 
     # quick val accuracy
     model.eval()
@@ -84,5 +104,7 @@ for epoch in range(10):
             correct += (preds == gold).sum().item()
             total   += gold.size(0)
     print(f'E{epoch}: val-acc {(correct/total)*100:.2f}%')
-    wandb.log({"val/acc": (correct/total)*100})
-wandb.finish()
+    if DO_WANDB:
+        wandb.log({"val/acc": (correct/total)*100})
+if DO_WANDB:
+    wandb.finish()

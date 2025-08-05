@@ -5,7 +5,7 @@
 Per-patch top-k nearest words from ConceptNet Numberbatch using DenseCLIP text encoder.
 
 Flow:
-1) Load DenseCLIPHeatmap (backbone + text encoder + context decoder).
+1) Load DenseCLIP (backbone + text encoder + context decoder).
 2) Read numberbatch-en-19.08.txt.gz (word + vector per line).
 3) Convert word -> prompt text (replace '_' with ' ', optional --template).
 4) Encode all prompts with DenseCLIP text encoder -> CLIP-space matrix T [V,C].
@@ -44,9 +44,8 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
-# Reuse your previous code
 from denseclip_heatmap import (
-    DenseCLIPHeatmap,
+    DenseCLIP,
     load_image_clip,
     save_heatmap_overlay,
 )
@@ -129,7 +128,7 @@ def load_numberbatch_txt_gz(path: str,
 # Text bank builder + cache (Numberbatch -> CLIP text space)
 # ----------------------------
 
-def _cache_signature(model: DenseCLIPHeatmap,
+def _cache_signature(model: DenseCLIP,
                      nb_dim: int,
                      nb_path: str,
                      template: Optional[str]) -> Dict:
@@ -145,7 +144,7 @@ def _cache_signature(model: DenseCLIPHeatmap,
     return sig
 
 @torch.no_grad()
-def build_or_load_nb_textbank(model: DenseCLIPHeatmap,
+def build_or_load_nb_textbank(model: DenseCLIP,
                               device: str,
                               nb_path: str,
                               cache_path: Optional[str] = None,
@@ -205,7 +204,9 @@ def build_or_load_nb_textbank(model: DenseCLIPHeatmap,
     print("🔹 Encoding Numberbatch tokens in CLIP text space...")
     for i in range(0, len(tokens_text), batch_size):
         chunk = tokens_text[i:i+batch_size]
-        t = model.encode_text(chunk, device=device)  # [B=1, K, C]
+        with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
+            t = model.encode_text(chunk, device=device)  # [B=1, K, C]
+        
         t = F.normalize(t[0].float(), dim=-1)        # [K,C], float32
         embs.append(t.cpu())
         if (i // batch_size) % 2 == 0:
@@ -239,7 +240,7 @@ def build_or_load_nb_textbank(model: DenseCLIPHeatmap,
 # ----------------------------
 
 @torch.no_grad()
-def per_patch_topk_from_image(model: DenseCLIPHeatmap,
+def per_patch_topk_from_image(model: DenseCLIP,
                               device: str,
                               image_tensor: torch.Tensor,   # [1,3,H,W], CLIP-normalized
                               T_clip: torch.Tensor,         # [V,C], on device, dtype bf16/fp16/fp32
@@ -360,13 +361,13 @@ def main():
     p.add_argument('--arch', default='vit-b-16', choices=['rn50','rn101','vit-b-16'])
     p.add_argument('--device', default='cuda')
     # Image + heatmap (optional overlay like your original)
-    p.add_argument('--image', default='/speedy/DenseInject/datasets/coco/test2017/000000000001.jpg')
+    p.add_argument('--image', default='/speedy/DenseInject/datasets/coco/test2017/000000000016.jpg')
     p.add_argument('--text', default="")  # just for printing heatmap stats/overlay title
     p.add_argument('--out', default="heatmap_nb.png")
     # Numberbatch
     p.add_argument('--nb_path', default="/speedy/DenseInject/datasets/numberbatch/numberbatch-en-19.08.txt.gz")
     p.add_argument('--nb_limit', type=int, default=0, help="For quick tests, limit NB entries (>0).")
-    p.add_argument('--nb_cache', default="text_embedding_cache.pt", help="Path to save/load text-bank cache (e.g., textbank_nb.pt).")
+    p.add_argument('--nb_cache', default="/speedy/DenseInject/denseclipinference/text_embedding_cache.pt", help="Path to save/load text-bank cache (e.g., textbank_nb.pt).")
     p.add_argument('--template', default="", help="Optional prompt template e.g. 'a photo of {}'.")
     p.add_argument('--batch_size_text', type=int, default=4096)
     # Retrieval
@@ -384,7 +385,7 @@ def main():
     print(f"🖥️  Using device: {dev}")
 
     # Model
-    model = DenseCLIPHeatmap(args.arch, args.ckpt, device=dev).eval().float()
+    model = DenseCLIP(args.arch, args.ckpt, device=dev).eval().float()
     model = model.to(device=dev, dtype=torch.float32)  # <- cast params & buffers to fp32
 
 
