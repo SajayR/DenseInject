@@ -148,6 +148,44 @@ class NBInjector(nn.Module):
 
 # ---------- Main module ------------------------------------------------------
 
+@torch.no_grad()
+def kmeans_cosine(V, K, iters=10):
+    """
+    V : (B,P,C) L2-normalized on C
+    K : #clusters
+    returns: A (B,P) long, MU (B,K,C) L2-normalized
+    """
+    B,P,C = V.shape
+    # k-means++ init (simple): pick K random distinct patches per image
+    idx0 = torch.randint(P, (B, K), device=V.device)
+    MU = F.normalize(V.gather(1, idx0[...,None].expand(-1,-1,C)), dim=-1)  # (B,K,C)
+
+    for _ in range(iters):
+        # Assign: argmax cosine ≡ argmax dot on L2 rows
+        # scores: (B,P,K)
+        scores = torch.einsum('bpc,bkc->bpk', V, MU)
+        A = scores.argmax(dim=2)  # (B,P)
+        #centroidshit
+        MU_new = torch.zeros_like(MU)
+        counts = torch.zeros(B, K, 1, device=V.device)
+
+        # scatter add per cluster
+        MU_new = MU_new.scatter_add(1,
+            A.unsqueeze(-1).expand(-1,-1,C), V)
+        counts = counts.scatter_add(1,
+            A.unsqueeze(-1), torch.ones(B,P,1, device=V.device))
+
+        # handle empty clusters by keeping old centroid
+        mask = counts.squeeze(-1) > 0
+        MU_updated = torch.where(
+            mask.unsqueeze(-1),
+            MU_new / counts.clamp_min(1.0),
+            MU  # keep previous centroid if empty
+        )
+        MU = F.normalize(MU_updated, dim=-1)
+
+    return A, MU
+
 class QCDenseCLIP(nn.Module):
     """
     Question-Conditioned DenseCLIP with a **single** trainable DistilBERT
@@ -266,41 +304,31 @@ class QCDenseCLIP(nn.Module):
         B = images.size(0)
 
         # (1) vision → patch tokens (no cls)
-        _, fmap      = self.vision.encode_image_to_embeddings(images)
-        #print(fmap.shape)
-        #simulate fake fmap for ablation
-        #fmap = torch.randn(B, self.v_dim, 16, 16, device=images.device) 
+        # (1) vision → patches
+        _, fmap = self.vision.encode_image_to_embeddings(images)
+        v_seq   = fmap.flatten(2).permute(0,2,1)               # (B,P,C)
+        v_seq   = F.normalize(v_seq, dim=-1)
 
-        v_seq        = fmap.flatten(2).permute(0,2,1)       # (B,P,C_v)
+        # (2) cluster → shrink to K tokens
+        K = 12  # e.g., for 16×16 patches; tune 8–16
+        A, MU = kmeans_cosine(v_seq, K=K, iters=10)            # A:(B,P), MU:(B,K,C)
 
+        # (3) NB retrieval + fusion on centroids
         if self.enable_nb and self.nb.T_clip.numel() > 0:
-            # retrieve top-k for each patch (chunked to cap memory)
-            #print('retrieving top-k for each patch')
-            idx, scores, nb_sel = self.nb.retrieve(v_seq, topk=self.nb_k, chunk_patches=2048)
-            # fuse by concat+gate → same shape as v_seq
-            v_seq = self.nb.fuse_concat(v_seq, nb_sel, scores)
+            idx, scores, nb_sel = self.nb.retrieve(MU, topk=self.nb_k, chunk_patches=1024)
+            MU = self.nb.fuse_concat(MU, nb_sel, scores)       # (B,K,C)
 
-        # (2) Q tokens
-        q_seq = self._encode_question(questions)     # (B,L,C_v)
+        # (4) question tokens (unchanged)
+        q_seq = self._encode_question(questions)               # (B,L,C)
 
-        # (3) Q→V cross-attention pooled vector
-        #z_qv         = F.normalize(self.q2v(q_seq, v_seq), dim=-1)  # (B,C_v)
+        # (5) joint encoder on [K cluster tokens + L question tokens]
+        joint_seq = torch.cat([MU, q_seq], dim=1)              # (B, K+L, C)
+        joint_out = self.joint_enc(joint_seq.permute(1,0,2)).permute(1,0,2)
+        z_qv      = F.normalize(joint_out[:, 0], dim=-1)       # (B,C)
 
-        # (3) Joint Q + V Transformer
-        joint_seq = torch.cat([v_seq, q_seq], dim=1)      # (B, L+P, C_v)
-        #print("joint_seq", joint_seq.shape)
-        joint_out = self.joint_enc(
-                           joint_seq.permute(1, 0, 2)        # → (L+P, B, C_v)
-                       ).permute(1, 0, 2)                    # → (B, L+P, C_v)
-
-        # Take first question token ([CLS]) as the pooled, question-conditioned vector
-        z_qv = F.normalize(joint_out[:, 0], dim=-1)  # (B, C_v)
-
-        # (4) answer embeddings
-        a_emb = F.normalize(self._encode_answers(answers), dim=-1)  # (B,M,C_v)
-
-        # (5) cosine similarities → logits
-        scale = self.logit_scale.exp()                      # learnable τ^-1
-        logits = scale * torch.einsum('bd,bmd->bm', z_qv, a_emb)  # (B,M)
-
+        # (6) answers + logits (unchanged)
+        a_emb  = F.normalize(self._encode_answers(answers), dim=-1)  # (B,M,C)
+        scale  = self.logit_scale.exp()
+        logits = scale * torch.einsum('bd,bmd->bm', z_qv, a_emb)
         return logits
+

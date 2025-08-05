@@ -6,7 +6,7 @@ import tqdm
 import os
 import wandb
 import torch, torch.nn.functional as F
-DO_WANDB = True
+DO_WANDB = False
 if DO_WANDB:
     wandb.init(project="DenseInject", name="DenseCLIP+NB")
 
