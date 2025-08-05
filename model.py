@@ -50,18 +50,18 @@ class NBInjector(nn.Module):
         self.k = k
         self.include_scores = include_scores
 
-        in_dim = k * nb_dim + (k if include_scores else 0)
+        # NEW: input dim includes visual features + NB features + scores
+        nb_in_dim = k * nb_dim + (k if include_scores else 0)
+        total_in_dim = v_dim + nb_in_dim  # visual + NB features
+        
         h = proj_hidden or max(512, v_dim)
-        self.nb_proj = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, h),
+        self.fusion_proj = nn.Sequential(
+            #nn.LayerNorm(total_in_dim),
+            nn.Linear(total_in_dim, h),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(h, v_dim),
         )
-        # gate
-        self.gate = nn.Linear(v_dim * (1 if gate_scalar else 2), 1 if gate_scalar else v_dim)
-        self.gate_scalar = gate_scalar
         # temperature for weighting scores if you later use weighted sum; here we only pass scores to the MLP
         self.tau = nn.Parameter(torch.tensor(0.07))
 
@@ -71,8 +71,8 @@ class NBInjector(nn.Module):
 
     def set_bank(self, T_clip: torch.Tensor, nb_vecs: torch.Tensor):
         # T_clip should already be L2-normalized rows
-        self.T_clip = T_clip  # on device, dtype can be bf16/fp16
-        self.nb_vecs = nb_vecs.cpu()  # keep on CPU float32
+        self.T_clip = T_clip.cuda()  # on device, dtype can be bf16/fp16
+        self.nb_vecs = nb_vecs.cuda()  # keep on CPU float32
 
     @torch.no_grad()
     def retrieve(self, v_seq: torch.Tensor, topk: Optional[int] = None,
@@ -119,7 +119,7 @@ class NBInjector(nn.Module):
         val = torch.stack(val_all, dim=0)  # (B,P,k) CPU float32
 
         # Gather NB vectors: for speed, one big index_select then reshape
-        BPK = idx.reshape(-1)  # (B*P*k,)
+        BPK = idx.reshape(-1).cuda()  # (B*P*k,)
         nb_sel = self.nb_vecs.index_select(0, BPK).reshape(B, P, k, self.nb_dim)  # CPU float32
         return idx, val, nb_sel
 
@@ -133,23 +133,17 @@ class NBInjector(nn.Module):
         B, P, C = v_seq.shape
         k, Dnb = self.k, self.nb_dim
 
-        # concat NB vectors (and optionally scores), project
-        print("nb_sel", nb_sel.shape)
-        x = nb_sel.reshape(B, P, k * Dnb).to(v_seq.device, non_blocking=True)
-        print("x", x.shape)
+        # Prepare NB features
+        nb_flat = nb_sel.reshape(B, P, k * Dnb).to(v_seq.device, non_blocking=True)
         if self.include_scores:
-            x = torch.cat([x, scores.to(v_seq.device, non_blocking=True)], dim=-1)  # (B,P, k*Dnb + k)
-        nb_feat = self.nb_proj(x)  # (B,P,C_v)
-
-        # gate
-        if self.gate_scalar:
-            g_in = v_seq  # scalar gate uses only v
-        else:
-            g_in = torch.cat([v_seq, nb_feat], dim=-1)
-        g = torch.sigmoid(self.gate(g_in))  # (B,P,1) or (B,P,C_v)
-        if g.shape[-1] == 1: g = g.expand_as(v_seq)
-
-        fused = F.layer_norm(v_seq + g * nb_feat, (C,))
+            nb_flat = torch.cat([nb_flat, scores.to(v_seq.device, non_blocking=True)], dim=-1)  # (B,P, k*Dnb + k)
+        
+        # Concat visual + NB features, then project
+        combined = torch.cat([v_seq, nb_flat], dim=-1)  # (B,P, C_v + k*Dnb + k)
+        fused = self.fusion_proj(combined)  # (B,P,C_v)
+        
+        # Apply layer norm to the output
+        fused = F.layer_norm(fused, (C,))
         return fused
 
 # ---------- Main module ------------------------------------------------------
@@ -175,7 +169,7 @@ class QCDenseCLIP(nn.Module):
         print("v_dim", self.v_dim)
         self.enable_nb = True
 
-        self.nb_k = 1        # default top-k
+        self.nb_k = 3        # default top-k
         self.nb_dim = 300       # Numberbatch dim (19.08 is 300-d)
         self.nb = NBInjector(v_dim=self.v_dim, nb_dim=self.nb_dim, k=self.nb_k, include_scores=True, proj_hidden=None, gate_scalar=False)
 
@@ -183,7 +177,8 @@ class QCDenseCLIP(nn.Module):
         # ➋ Trainable DistilBERT tower  (shared by Q and A)
         self.text_tok = DistilBertTokenizerFast.from_pretrained(distil_name)
         self.text_enc = DistilBertModel.from_pretrained(distil_name).eval()
-        for p in self.text_enc.parameters(): p.requires_grad = False
+        for p in self.text_enc.parameters(): 
+            p.requires_grad = False
         self.t_dim = self.text_enc.config.hidden_size  # 768
 
         # If dims don’t match → small projection so everything sits in v_dim
@@ -193,9 +188,18 @@ class QCDenseCLIP(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=self.v_dim, nhead=8, dim_feedforward=self.v_dim*4)
         self.t2v_enc = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
+        # ➌ Joint token Transformer (Q tokens + V patches)
+        joint_layer = nn.TransformerEncoderLayer(
+            d_model=self.v_dim,          # same dimensionality
+            nhead=num_heads,
+            dim_feedforward=self.v_dim * 4
+        )
+        self.joint_enc = nn.TransformerEncoder(joint_layer, num_layers=2)
+        #self.joint_pe = nn.Parameter(torch.zeros(1, 1, self.v_dim))
+
 
         # ➌ Cross-attention & pool
-        self.q2v = Q2VCrossAttn(self.v_dim, num_heads=num_heads)
+        #self.q2v = Q2VCrossAttn(self.v_dim, num_heads=num_heads)
 
         # temperature learnable (init 0.07 like CLIP)
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1/0.07)))
@@ -271,18 +275,29 @@ class QCDenseCLIP(nn.Module):
 
         if self.enable_nb and self.nb.T_clip.numel() > 0:
             # retrieve top-k for each patch (chunked to cap memory)
+            #print('retrieving top-k for each patch')
             idx, scores, nb_sel = self.nb.retrieve(v_seq, topk=self.nb_k, chunk_patches=2048)
             # fuse by concat+gate → same shape as v_seq
             v_seq = self.nb.fuse_concat(v_seq, nb_sel, scores)
 
         # (2) Q tokens
-        q_seq        = self._encode_question(questions)     # (B,L,C_v)
+        q_seq = self._encode_question(questions)     # (B,L,C_v)
 
         # (3) Q→V cross-attention pooled vector
-        z_qv         = F.normalize(self.q2v(q_seq, v_seq), dim=-1)  # (B,C_v)
+        #z_qv         = F.normalize(self.q2v(q_seq, v_seq), dim=-1)  # (B,C_v)
+
+        # (3) Joint Q + V Transformer
+        joint_seq = torch.cat([v_seq, q_seq], dim=1)      # (B, L+P, C_v)
+        #print("joint_seq", joint_seq.shape)
+        joint_out = self.joint_enc(
+                           joint_seq.permute(1, 0, 2)        # → (L+P, B, C_v)
+                       ).permute(1, 0, 2)                    # → (B, L+P, C_v)
+
+        # Take first question token ([CLS]) as the pooled, question-conditioned vector
+        z_qv = F.normalize(joint_out[:, 0], dim=-1)  # (B, C_v)
 
         # (4) answer embeddings
-        a_emb        = F.normalize(self._encode_answers(answers), dim=-1)  # (B,M,C_v)
+        a_emb = F.normalize(self._encode_answers(answers), dim=-1)  # (B,M,C_v)
 
         # (5) cosine similarities → logits
         scale = self.logit_scale.exp()                      # learnable τ^-1

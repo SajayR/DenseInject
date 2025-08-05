@@ -6,7 +6,7 @@ import tqdm
 import os
 import wandb
 import torch, torch.nn.functional as F
-DO_WANDB = False
+DO_WANDB = True
 if DO_WANDB:
     wandb.init(project="DenseInject", name="DenseCLIP+NB")
 
@@ -61,17 +61,17 @@ def collate_fn(batch):
             'correct_choice_idx': labels}
 
 train_loader = DataLoader(train_set,
-                          batch_size=256,
+                          batch_size=128,
                           shuffle=True,
                           num_workers=12,
                           collate_fn=collate_fn)
 
-val_loader   = DataLoader(val_set,   batch_size=512, shuffle=False, num_workers=12, collate_fn=collate_fn)
+val_loader   = DataLoader(val_set, batch_size=512, shuffle=False, num_workers=12, collate_fn=collate_fn)
 
 criterion = nn.CrossEntropyLoss()
-opt       = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+opt       = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
 
-for epoch in range(10):
+for epoch in range(20):
     model.train()
     for batch in tqdm.tqdm(train_loader):
         imgs = batch['image'].to(device)
