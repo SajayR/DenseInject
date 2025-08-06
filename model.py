@@ -5,7 +5,7 @@ from denseclip import DenseCLIP           # your minimal DenseCLIP wrapper
 import math
 from typing import Optional, Tuple
 from utils.top_k_resized import build_or_load_nb_textbank
-
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 # ---------- Helpers ----------------------------------------------------------
@@ -29,10 +29,7 @@ class Q2VCrossAttn(nn.Module):
         cls     = h[:, 0]                         # take “[CLS]”-token of Q
         return self.tanh(self.out_proj(cls))      # (B,C)  question-conditioned
 
-# --- in model.py (top) ---
-import math
-from typing import Optional, Tuple
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 
 class NBInjector(nn.Module):
     """
@@ -49,6 +46,8 @@ class NBInjector(nn.Module):
         self.nb_dim = nb_dim
         self.k = k
         self.include_scores = include_scores
+        self._last_idx = None
+        self._last_scores = None
 
         # NEW: input dim includes visual features + NB features + scores
         nb_in_dim = k * nb_dim + (k if include_scores else 0)
@@ -58,6 +57,7 @@ class NBInjector(nn.Module):
         self.fusion_proj = nn.Sequential(
             #nn.LayerNorm(total_in_dim),
             nn.Linear(total_in_dim, h),
+            nn.Linear(h, h),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(h, v_dim),
@@ -69,10 +69,11 @@ class NBInjector(nn.Module):
         self.register_buffer("T_clip", torch.empty(0), persistent=False)  # [V, C_v] on device
         self.nb_vecs = None  # CPU FloatTensor [V, D_nb]
 
-    def set_bank(self, T_clip: torch.Tensor, nb_vecs: torch.Tensor):
-        # T_clip should already be L2-normalized rows
-        self.T_clip = T_clip.cuda()  # on device, dtype can be bf16/fp16
-        self.nb_vecs = nb_vecs.cuda()  # keep on CPU float32
+    def set_bank(self, T_clip: torch.Tensor, nb_vecs: torch.Tensor, tokens_text):
+        self.T_clip = T_clip.cuda()
+        self.nb_vecs = nb_vecs.cuda()
+        self.tokens_text = tokens_text  # list[str]
+
 
     @torch.no_grad()
     def retrieve(self, v_seq: torch.Tensor, topk: Optional[int] = None,
@@ -121,6 +122,8 @@ class NBInjector(nn.Module):
         # Gather NB vectors: for speed, one big index_select then reshape
         BPK = idx.reshape(-1).cuda()  # (B*P*k,)
         nb_sel = self.nb_vecs.index_select(0, BPK).reshape(B, P, k, self.nb_dim)  # CPU float32
+        self._last_idx = idx[0].clone()     # (P,k) CPU long
+        self._last_scores  = val[0].clone()     # (P,k) CPU float32
         return idx, val, nb_sel
 
     def fuse_concat(self, v_seq: torch.Tensor, nb_sel: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
@@ -220,7 +223,6 @@ class QCDenseCLIP(nn.Module):
         self.t_dim = self.text_enc.config.hidden_size  # 768
 
         # If dims don’t match → small projection so everything sits in v_dim
-        #self.t2v = nn.Linear(self.t_dim, self.v_dim, bias=False)
 
         self.t2v_in = nn.Linear(self.t_dim, self.v_dim)
         encoder_layer = nn.TransformerEncoderLayer(d_model=self.v_dim, nhead=8, dim_feedforward=self.v_dim*4)
@@ -233,22 +235,17 @@ class QCDenseCLIP(nn.Module):
             dim_feedforward=self.v_dim * 4
         )
         self.joint_enc = nn.TransformerEncoder(joint_layer, num_layers=2)
-        #self.joint_pe = nn.Parameter(torch.zeros(1, 1, self.v_dim))
-
-
-        # ➌ Cross-attention & pool
-        #self.q2v = Q2VCrossAttn(self.v_dim, num_heads=num_heads)
 
         # temperature learnable (init 0.07 like CLIP)
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1/0.07)))
 
     # --- in QCDenseCLIP ---
-    def set_nb_bank(self, T_clip: torch.Tensor, nb_vecs: torch.Tensor):
+    def set_nb_bank(self, T_clip: torch.Tensor, nb_vecs: torch.Tensor, tokens_text):
         """
         T_clip: [V, C_v] L2-normalized text-bank on same device as vision.
         nb_vecs: [V, 300] CPU float32 Numberbatch full table.
         """
-        self.nb.set_bank(T_clip, nb_vecs)
+        self.nb.set_bank(T_clip, nb_vecs, tokens_text)
 
 
     # --------- encoding utilities -------------------------------------------
